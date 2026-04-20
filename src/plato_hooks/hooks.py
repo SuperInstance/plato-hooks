@@ -1,149 +1,232 @@
-"""Git hook management — conditional triggers, chains, rate limiting, callbacks."""
+"""Git hook management — conditional triggers, chains, rate limiting, error recovery, and audit."""
 import subprocess
 import os
 import time
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 from collections import defaultdict
+
+class HookResult(Enum):
+    SUCCESS = "success"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+    RATE_LIMITED = "rate_limited"
+    CONDITION_FALSE = "condition_false"
+    CHAIN_ABORTED = "chain_aborted"
 
 @dataclass
 class Hook:
     name: str
     event: str
     command: str = ""
-    callback: str = ""  # reference to registered callback
+    callback: str = ""
     enabled: bool = True
     trigger_count: int = 0
     last_triggered: float = 0.0
-    condition: str = ""  # eval condition
-    rate_limit: float = 0.0  # min seconds between triggers
-    priority: int = 0  # higher = runs first
-    chain: list[str] = field(default_factory=list)  # hooks to run after this one
+    condition: str = ""
+    rate_limit: float = 0.0
+    priority: int = 0
+    chain: list[str] = field(default_factory=list)
+    timeout: float = 30.0
+    retry_count: int = 0
+    max_retries: int = 0
+    retry_delay: float = 1.0
+    fail_open: bool = True  # if True, failure doesn't block
+    tags: list[str] = field(default_factory=list)
+
+@dataclass
+class HookExecution:
+    hook_name: str
+    event: str
+    result: HookResult
+    output: str = ""
+    error: str = ""
+    duration_ms: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+    retry_num: int = 0
+
+@dataclass
+class HookPattern:
+    pattern: str  # glob pattern for hook matching
+    event: str
+    handler: Callable
+    priority: int = 0
+    description: str = ""
 
 class HookManager:
     def __init__(self, repo_path: str = "."):
         self.repo_path = repo_path
-        self._hooks: dict[str, list[Hook]] = {}
+        self._hooks: dict[str, list[Hook]] = defaultdict(list)
         self._callbacks: dict[str, Callable] = {}
-        self._trigger_log: list[dict] = []
-        self._failures: list[dict] = []
+        self._patterns: list[HookPattern] = []
+        self._trigger_log: deque = deque(maxlen=500)
+        self._failures: list[HookExecution] = []
+        self._global_rate_limit: float = 0.0
+        self._last_global_trigger: float = 0.0
 
-    def register(self, name: str, event: str, command: str = "",
-                 callback: str = "", condition: str = "",
-                 rate_limit: float = 0.0, priority: int = 0) -> Hook:
-        h = Hook(name=name, event=event, command=command, callback=callback,
-                condition=condition, rate_limit=rate_limit, priority=priority)
-        if event not in self._hooks:
-            self._hooks[event] = []
-        self._hooks[event].append(h)
-        self._hooks[event].sort(key=lambda x: x.priority, reverse=True)
-        return h
+    def register(self, hook: Hook):
+        self._hooks[hook.event].append(hook)
+        self._hooks[hook.event].sort(key=lambda h: h.priority, reverse=True)
 
     def register_callback(self, name: str, fn: Callable):
         self._callbacks[name] = fn
 
-    def add_chain(self, hook_name: str, chain_to: list[str]):
-        for event_hooks in self._hooks.values():
-            for h in event_hooks:
-                if h.name == hook_name:
-                    h.chain.extend(chain_to)
-                    return
+    def register_pattern(self, pattern: str, event: str, handler: Callable,
+                        priority: int = 0, description: str = ""):
+        self._patterns.append(HookPattern(pattern, event, handler, priority, description))
+        self._patterns.sort(key=lambda p: p.priority, reverse=True)
 
-    def trigger(self, event: str, context: dict = None) -> list[dict]:
+    def trigger(self, event: str, context: dict = None) -> list[HookExecution]:
+        if context is None:
+            context = {}
         results = []
-        context = context or {}
-        triggered_names = set()
+        hooks = self._hooks.get(event, [])
+        # Check global rate limit
+        if self._global_rate_limit > 0:
+            if time.time() - self._last_global_trigger < self._global_rate_limit:
+                return results
 
-        for h in self._hooks.get(event, []):
-            if not h.enabled:
+        for hook in hooks:
+            if not hook.enabled:
+                results.append(HookExecution(hook.name, event, HookResult.SKIPPED))
                 continue
-            if h.rate_limit > 0 and time.time() - h.last_triggered < h.rate_limit:
-                results.append({"hook": h.name, "status": "rate_limited",
-                               "message": f"Rate limited ({h.rate_limit}s)"})
-                continue
-            if h.condition:
-                try:
-                    if not eval(h.condition, {"__builtins__": {}}, context):
-                        results.append({"hook": h.name, "status": "skipped",
-                                       "message": "Condition not met"})
-                        continue
-                except Exception as e:
-                    results.append({"hook": h.name, "status": "error",
-                                   "message": f"Condition error: {e}"})
+            # Rate limit check
+            if hook.rate_limit > 0 and hook.last_triggered > 0:
+                if time.time() - hook.last_triggered < hook.rate_limit:
+                    results.append(HookExecution(hook.name, event, HookResult.RATE_LIMITED))
                     continue
-
-            h.trigger_count += 1
-            h.last_triggered = time.time()
-            triggered_names.add(h.name)
-
-            # Execute command or callback
-            if h.callback and h.callback in self._callbacks:
+            # Condition check
+            if hook.condition:
                 try:
-                    cb_result = self._callbacks[h.callback](context)
-                    results.append({"hook": h.name, "status": "ok",
-                                   "type": "callback", "result": str(cb_result)})
-                except Exception as e:
-                    results.append({"hook": h.name, "status": "error",
-                                   "type": "callback", "message": str(e)})
-                    self._failures.append({"hook": h.name, "error": str(e), "timestamp": time.time()})
-            elif h.command:
+                    if not eval(hook.condition, {"__builtins__": {}}, context):
+                        results.append(HookExecution(hook.name, event, HookResult.CONDITION_FALSE))
+                        continue
+                except:
+                    results.append(HookExecution(hook.name, event, HookResult.CONDITION_FALSE))
+                        continue
+            # Execute with retries
+            result = self._execute_hook(hook, event, context)
+            results.append(result)
+            hook.last_triggered = time.time()
+            self._trigger_log.append(result)
+            if result.result == HookResult.FAILED and not hook.fail_open:
+                self._failures.append(result)
+                break  # abort chain on hard failure
+            # Chain execution
+            if result.result == HookResult.SUCCESS and hook.chain:
+                for chain_name in hook.chain:
+                    chain_hook = self._find_hook(chain_name)
+                    if chain_hook:
+                        chain_result = self._execute_hook(chain_hook, event, context)
+                        results.append(chain_result)
+                        if chain_result.result == HookResult.FAILED and not chain_hook.fail_open:
+                            break
+        # Pattern matching
+        for pattern in self._patterns:
+            if pattern.event == event:
                 try:
-                    result = subprocess.run(h.command, shell=True, capture_output=True,
-                                           text=True, cwd=self.repo_path, timeout=30)
-                    status = "ok" if result.returncode == 0 else "error"
-                    output = result.stdout[:500]
-                    if result.returncode != 0:
-                        output += result.stderr[:200]
-                        self._failures.append({"hook": h.name, "output": output,
-                                              "code": result.returncode, "timestamp": time.time()})
-                    results.append({"hook": h.name, "status": status,
-                                   "type": "command", "output": output, "code": result.returncode})
-                except Exception as e:
-                    results.append({"hook": h.name, "status": "error",
-                                   "type": "command", "message": str(e)})
-                    self._failures.append({"hook": h.name, "error": str(e), "timestamp": time.time()})
-
-            # Process chains
-            for chain_name in h.chain:
-                chain_results = self.trigger(chain_name, context)
-                results.extend(chain_results)
-
-        self._log(event, context, results)
+                    pattern.handler(event, context)
+                except:
+                    pass
+        self._last_global_trigger = time.time()
         return results
 
-    def _log(self, event: str, context: dict, results: list[dict]):
-        entry = {"event": event, "timestamp": time.time(),
-                "results": results, "context_keys": list(context.keys())}
-        self._trigger_log.append(entry)
-        if len(self._trigger_log) > 1000:
-            self._trigger_log = self._trigger_log[-1000:]
+    def _execute_hook(self, hook: Hook, event: str, context: dict) -> HookExecution:
+        start = time.time()
+        last_error = ""
+        for attempt in range(hook.max_retries + 1):
+            try:
+                if hook.callback and hook.callback in self._callbacks:
+                    output = self._callbacks[hook.callback](event, context)
+                    hook.trigger_count += 1
+                    return HookExecution(hook.name, event, HookResult.SUCCESS,
+                                        output=str(output) if output else "",
+                                        duration_ms=(time.time() - start) * 1000,
+                                        retry_num=attempt)
+                elif hook.command:
+                    env = os.environ.copy()
+                    env.update({k: str(v) for k, v in context.items() if isinstance(v, (str, int, float))})
+                    result = subprocess.run(hook.command, shell=True, cwd=self.repo_path,
+                                          capture_output=True, text=True, timeout=hook.timeout, env=env)
+                    hook.trigger_count += 1
+                    if result.returncode != 0:
+                        last_error = result.stderr
+                        if attempt < hook.max_retries:
+                            time.sleep(hook.retry_delay)
+                            continue
+                        return HookExecution(hook.name, event, HookResult.FAILED,
+                                           output=result.stdout, error=result.stderr,
+                                           duration_ms=(time.time() - start) * 1000,
+                                           retry_num=attempt)
+                    return HookExecution(hook.name, event, HookResult.SUCCESS,
+                                       output=result.stdout,
+                                       duration_ms=(time.time() - start) * 1000,
+                                       retry_num=attempt)
+            except subprocess.TimeoutExpired:
+                last_error = f"Timeout after {hook.timeout}s"
+                if attempt < hook.max_retries:
+                    time.sleep(hook.retry_delay)
+                    continue
+            except Exception as e:
+                last_error = str(e)
+                if attempt < hook.max_retries:
+                    time.sleep(hook.retry_delay)
+                    continue
+        return HookExecution(hook.name, event, HookResult.FAILED, error=last_error,
+                           duration_ms=(time.time() - start) * 1000,
+                           retry_num=hook.max_retries)
 
-    def enable(self, name: str):
-        for hooks in self._hooks.values():
-            for h in hooks:
-                if h.name == name: h.enabled = True
+    def _find_hook(self, name: str) -> Optional[Hook]:
+        for event_hooks in self._hooks.values():
+            for hook in event_hooks:
+                if hook.name == name:
+                    return hook
+        return None
 
-    def disable(self, name: str):
-        for hooks in self._hooks.values():
-            for h in hooks:
-                if h.name == name: h.enabled = False
+    def hooks_for_event(self, event: str) -> list[Hook]:
+        return self._hooks.get(event, [])
 
-    def list_hooks(self, event: str = "") -> list[dict]:
-        events = {event} if event else set(self._hooks.keys())
-        result = []
-        for e in events:
-            for h in self._hooks.get(e, []):
-                result.append({"name": h.name, "event": e, "enabled": h.enabled,
-                              "triggers": h.trigger_count, "priority": h.priority,
-                              "has_chain": bool(h.chain), "has_condition": bool(h.condition),
-                              "rate_limit": h.rate_limit})
-        return result
+    def execution_log(self, limit: int = 50) -> list[HookExecution]:
+        return list(self._trigger_log)[-limit:]
+
+    def failure_log(self, limit: int = 50) -> list[HookExecution]:
+        return self._failures[-limit:]
+
+    def clear_failures(self):
+        self._failures.clear()
+
+    def disable_all(self, event: str = ""):
+        if event:
+            for hook in self._hooks.get(event, []):
+                hook.enabled = False
+        else:
+            for event_hooks in self._hooks.values():
+                for hook in event_hooks:
+                    hook.enabled = False
+
+    def enable_all(self, event: str = ""):
+        if event:
+            for hook in self._hooks.get(event, []):
+                hook.enabled = True
+        else:
+            for event_hooks in self._hooks.values():
+                for hook in event_hooks:
+                    hook.enabled = True
 
     @property
     def stats(self) -> dict:
-        events = {e: len(hs) for e, hs in self._hooks.items()}
-        total_triggers = sum(h.trigger_count for hs in self._hooks.values() for h in hs)
-        return {"events": events, "total_hooks": sum(len(v) for v in self._hooks.values()),
-                "total_triggers": total_triggers, "callbacks": len(self._callbacks),
-                "failures": len(self._failures), "log_entries": len(self._trigger_log)}
+        total = sum(len(h) for h in self._hooks.values())
+        enabled = sum(1 for h_list in self._hooks.values() for h in h_list if h.enabled)
+        events = len(self._hooks)
+        callbacks = len(self._callbacks)
+        patterns = len(self._patterns)
+        triggers = sum(h.trigger_count for h_list in self._hooks.values() for h in h_list)
+        return {"hooks": total, "enabled": enabled, "events": events,
+                "callbacks": callbacks, "patterns": patterns,
+                "total_triggers": triggers, "failures": len(self._failures),
+                "log_entries": len(self._trigger_log)}
+
+from collections import deque
+from enum import Enum
