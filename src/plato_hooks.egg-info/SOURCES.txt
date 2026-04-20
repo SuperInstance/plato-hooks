@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/plato_hooks/__init__.py
+src/plato_hooks/hooks.py
+src/plato_hooks.egg-info/PKG-INFO
+src/plato_hooks.egg-info/SOURCES.txt
+src/plato_hooks.egg-info/dependency_links.txt
+src/plato_hooks.egg-info/top_level.txt
